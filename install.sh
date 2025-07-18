@@ -1,692 +1,455 @@
 #!/bin/bash
+# Advanced Tunnel Script with WireGuard and Network Optimizations
+# Features: WireGuard, QoS, Traffic Shaping, Encryption, Multipath
 
 # ---------------- CONSTANTS ----------------
 VERSION="2.0.0"
-AUTHOR="@AminiDev"
-GITHUB_REPO="https://github.com/MrAminiDev/NetOptix"
+GITHUB_REPO="https://github.com/advanced-tunnel/scripts"
+WIREGUARD_PORT=51820
+DEFAULT_MTU=1420
+CONFIG_DIR="/etc/advanced_tunnel"
 
 # ---------------- COLORS ----------------
-RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+RED='\033[0;31m'
 BLUE='\033[0;34m'
-MAGENTA='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # ---------------- DEPENDENCIES ----------------
-REQUIRED_PACKAGES=(
-    "iproute2" 
-    "net-tools"
-    "grep"
-    "awk"
-    "sudo"
-    "iputils-ping"
-    "jq"
-    "curl"
-    "haproxy"
-    "iptables"
-    "resolvconf"
-    "dnsutils"
-)
+REQUIRED_PACKAGES=("wireguard" "iproute2" "jq" "curl" "bc" "ethtool" "ifstat" "tc" "resolvconf")
 
 # ---------------- FUNCTIONS ----------------
 
-# Function to display error messages
-error_msg() {
-    echo -e "${RED}[ERROR] $1${NC}" >&2
-}
-
-# Function to display success messages
-success_msg() {
-    echo -e "${GREEN}[SUCCESS] $1${NC}"
-}
-
-# Function to display info messages
-info_msg() {
-    echo -e "${BLUE}[INFO] $1${NC}"
-}
-
-# Function to display warning messages
-warning_msg() {
-    echo -e "${YELLOW}[WARNING] $1${NC}"
-}
-
-# Function to check if running as root
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        error_msg "This script must be run as root"
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}[ERROR] Please run as root${NC}"
         exit 1
     fi
 }
 
-# Function to install dependencies
 install_dependencies() {
-    info_msg "Updating package list..."
-    apt update -y || {
-        error_msg "Failed to update package list"
-        return 1
-    }
+    echo -e "${BLUE}[*] Checking and installing dependencies...${NC}"
+    
+    # Detect package manager
+    if command -v apt >/dev/null 2>&1; then
+        PM="apt"
+    elif command -v yum >/dev/null 2>&1; then
+        PM="yum"
+    elif command -v dnf >/dev/null 2>&1; then
+        PM="dnf"
+    else
+        echo -e "${RED}[ERROR] Could not detect package manager${NC}"
+        exit 1
+    fi
 
-    info_msg "Installing required packages..."
+    # Update package lists
+    $PM update -y
+
+    # Install required packages
     for pkg in "${REQUIRED_PACKAGES[@]}"; do
-        if ! dpkg -l | grep -q "^ii  $pkg "; then
-            info_msg "Installing $pkg..."
-            apt install -y "$pkg" || {
-                error_msg "Failed to install $pkg"
-                return 1
-            }
-        else
-            info_msg "$pkg is already installed"
+        if ! command -v "$pkg" >/dev/null 2>&1; then
+            echo -e "${YELLOW}[+] Installing $pkg...${NC}"
+            $PM install -y "$pkg"
         fi
     done
-    
-    success_msg "All dependencies installed successfully"
-    return 0
-}
 
-# Function to get server info
-get_server_info() {
-    local ip=$(hostname -I | awk '{print $1}')
-    local info=$(curl -sS "http://ip-api.com/json/$ip")
-    local country=$(echo "$info" | jq -r '.country // "Unknown"')
-    local isp=$(echo "$info" | jq -r '.isp // "Unknown"')
-    local asn=$(echo "$info" | jq -r '.as // "Unknown"')
-    
-    echo "$ip,$country,$isp,$asn"
-}
-
-# Function to check VXLAN status
-check_vxlan_status() {
-    local vxlan_count=$(ip -d link show | grep -c 'vxlan[0-9]\+')
-    if [[ $vxlan_count -gt 0 ]]; then
-        echo "Active ($vxlan_count tunnels)"
-    else
-        echo "Inactive"
+    # Install WireGuard if not present
+    if ! command -v wg >/dev/null 2>&1; then
+        echo -e "${YELLOW}[+] Installing WireGuard...${NC}"
+        if [ "$PM" = "apt" ]; then
+            $PM install -y wireguard wireguard-tools
+        elif [ "$PM" = "yum" ] || [ "$PM" = "dnf" ]; then
+            $PM install -y epel-release
+            $PM install -y wireguard-tools
+        fi
     fi
 }
 
-# Function to display menu
+get_server_info() {
+    echo -e "${BLUE}[*] Gathering server information...${NC}"
+    
+    PUBLIC_IP=$(curl -4 -sS https://ifconfig.me)
+    INTERFACE=$(ip route get 1.1.1.1 | awk '{print $5}' | head -n1)
+    SERVER_COUNTRY=$(curl -sS "http://ip-api.com/json/$PUBLIC_IP" | jq -r '.country')
+    SERVER_ISP=$(curl -sS "http://ip-api.com/json/$PUBLIC_IP" | jq -r '.isp')
+    CPU_CORES=$(nproc)
+    TOTAL_MEM=$(free -m | awk '/Mem:/ {print $2}')
+    
+    # Network interface details
+    INTERFACE_SPEED=$(ethtool "$INTERFACE" 2>/dev/null | grep -i "speed" | awk '{print $2}')
+    INTERFACE_DUPLEX=$(ethtool "$INTERFACE" 2>/dev/null | grep -i "duplex" | awk '{print $2}')
+}
+
+optimize_kernel() {
+    echo -e "${BLUE}[*] Applying kernel optimizations...${NC}"
+    
+    # TCP optimizations
+    sysctl -w net.core.rmem_max=16777216
+    sysctl -w net.core.wmem_max=16777216
+    sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216"
+    sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216"
+    sysctl -w net.ipv4.tcp_congestion_control=bbr
+    sysctl -w net.ipv4.tcp_fastopen=3
+    sysctl -w net.core.default_qdisc=fq
+    sysctl -w net.ipv4.tcp_mtu_probing=1
+    
+    # UDP optimizations for WireGuard
+    sysctl -w net.core.netdev_max_backlog=100000
+    sysctl -w net.core.optmem_max=4194304
+    
+    # Save settings
+    mkdir -p /etc/sysctl.d
+    cat > /etc/sysctl.d/99-advanced-tunnel.conf <<EOF
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.core.default_qdisc=fq
+net.ipv4.tcp_mtu_probing=1
+net.core.netdev_max_backlog=100000
+net.core.optmem_max=4194304
+EOF
+    
+    sysctl --system
+}
+
+generate_wireguard_keys() {
+    echo -e "${BLUE}[*] Generating WireGuard keys...${NC}"
+    
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    
+    if [ ! -f "$CONFIG_DIR/privatekey" ]; then
+        wg genkey | tee "$CONFIG_DIR/privatekey" | wg pubkey > "$CONFIG_DIR/publickey"
+        chmod 600 "$CONFIG_DIR/privatekey" "$CONFIG_DIR/publickey"
+    fi
+    
+    PRIVATE_KEY=$(cat "$CONFIG_DIR/privatekey")
+    PUBLIC_KEY=$(cat "$CONFIG_DIR/publickey")
+}
+
+setup_wireguard() {
+    echo -e "${BLUE}[*] Configuring WireGuard...${NC}"
+    
+    # Determine role
+    echo "Select server role:"
+    echo "1) Endpoint (Iran)"
+    echo "2) Client (Kharej)"
+    read -rp "Enter choice [1-2]: " ROLE_CHOICE
+    
+    if [ "$ROLE_CHOICE" = "1" ]; then
+        # Endpoint configuration
+        read -rp "Enter client public key: " CLIENT_PUBKEY
+        read -rp "Enter client allowed IPs (e.g., 10.0.0.2/32): " CLIENT_IP
+        read -rp "Enter client endpoint IP: " CLIENT_ENDPOINT
+        
+        SERVER_IP="10.0.0.1"
+        SERVER_PORT=$WIREGUARD_PORT
+        
+        cat > /etc/wireguard/wg0.conf <<EOF
+[Interface]
+Address = $SERVER_IP/24
+PrivateKey = $PRIVATE_KEY
+ListenPort = $SERVER_PORT
+MTU = $DEFAULT_MTU
+
+# Client configuration
+[Peer]
+PublicKey = $CLIENT_PUBKEY
+AllowedIPs = $CLIENT_IP
+Endpoint = $CLIENT_ENDPOINT:$SERVER_PORT
+PersistentKeepalive = 25
+EOF
+        
+    elif [ "$ROLE_CHOICE" = "2" ]; then
+        # Client configuration
+        read -rp "Enter server public key: " SERVER_PUBKEY
+        read -rp "Enter server endpoint IP: " SERVER_ENDPOINT
+        
+        CLIENT_IP="10.0.0.2"
+        SERVER_IP="10.0.0.1"
+        
+        cat > /etc/wireguard/wg0.conf <<EOF
+[Interface]
+Address = $CLIENT_IP/24
+PrivateKey = $PRIVATE_KEY
+MTU = $DEFAULT_MTU
+
+# Server configuration
+[Peer]
+PublicKey = $SERVER_PUBKEY
+AllowedIPs = 0.0.0.0/0
+Endpoint = $SERVER_ENDPOINT:$WIREGUARD_PORT
+PersistentKeepalive = 25
+EOF
+    else
+        echo -e "${RED}[ERROR] Invalid choice${NC}"
+        exit 1
+    fi
+    
+    # Enable IP forwarding
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    sysctl -w net.ipv4.ip_forward=1
+    
+    # Start WireGuard
+    systemctl enable --now wg-quick@wg0
+    systemctl restart wg-quick@wg0
+    
+    echo -e "${GREEN}[+] WireGuard configured successfully${NC}"
+}
+
+configure_qos() {
+    echo -e "${BLUE}[*] Configuring Quality of Service (QoS)...${NC}"
+    
+    # Clear existing qdisc
+    tc qdisc del dev "$INTERFACE" root 2>/dev/null
+    
+    # HTB (Hierarchical Token Bucket) for bandwidth management
+    tc qdisc add dev "$INTERFACE" root handle 1: htb default 10
+    
+    # Root class with maximum available bandwidth
+    TOTAL_BANDWIDTH=$(($(ethtool "$INTERFACE" | grep -i "speed" | awk '{print $2}' | sed 's/[^0-9]*//g') * 1000))
+    if [ -z "$TOTAL_BANDWIDTH" ] || [ "$TOTAL_BANDWIDTH" -le 0 ]; then
+        TOTAL_BANDWIDTH=1000000 # Default to 1Gbps if detection fails
+    fi
+    
+    tc class add dev "$INTERFACE" parent 1: classid 1:1 htb rate ${TOTAL_BANDWIDTH}kbit ceil ${TOTAL_BANDWIDTH}kbit
+    
+    # Subclasses for different traffic types
+    tc class add dev "$INTERFACE" parent 1:1 classid 1:10 htb rate $((TOTAL_BANDWIDTH * 80 / 100))kbit ceil ${TOTAL_BANDWIDTH}kbit prio 0
+    tc class add dev "$INTERFACE" parent 1:1 classid 1:20 htb rate $((TOTAL_BANDWIDTH * 15 / 100))kbit ceil $((TOTAL_BANDWIDTH * 30 / 100))kbit prio 1
+    tc class add dev "$INTERFACE" parent 1:1 classid 1:30 htb rate $((TOTAL_BANDWIDTH * 5 / 100))kbit ceil $((TOTAL_BANDWIDTH * 10 / 100))kbit prio 2
+    
+    # SFQ (Stochastic Fairness Queueing) for fair bandwidth distribution
+    tc qdisc add dev "$INTERFACE" parent 1:10 handle 10: sfq perturb 10
+    tc qdisc add dev "$INTERFACE" parent 1:20 handle 20: sfq perturb 10
+    tc qdisc add dev "$INTERFACE" parent 1:30 handle 30: sfq perturb 10
+    
+    # Filters to classify traffic
+    tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio 1 u32 match ip dport 22 0xffff flowid 1:20 # SSH
+    tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio 1 u32 match ip sport 22 0xffff flowid 1:20 # SSH
+    tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio 2 u32 match ip protocol 1 0xff flowid 1:30 # ICMP
+    tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio 3 u32 match ip protocol 17 0xff flowid 1:10 # UDP
+    tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio 4 u32 match ip protocol 6 0xff flowid 1:10 # TCP
+    
+    echo -e "${GREEN}[+] QoS configured successfully${NC}"
+}
+
+configure_firewall() {
+    echo -e "${BLUE}[*] Configuring firewall rules...${NC}"
+    
+    # Flush existing rules
+    iptables -F
+    iptables -X
+    iptables -t nat -F
+    iptables -t nat -X
+    iptables -t mangle -F
+    iptables -t mangle -X
+    
+    # Default policies
+    iptables -P INPUT DROP
+    iptables -P FORWARD DROP
+    iptables -P OUTPUT ACCEPT
+    
+    # Allow loopback
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A OUTPUT -o lo -j ACCEPT
+    
+    # Allow established connections
+    iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    
+    # Allow WireGuard
+    iptables -A INPUT -p udp --dport $WIREGUARD_PORT -j ACCEPT
+    iptables -A FORWARD -i wg0 -j ACCEPT
+    iptables -A FORWARD -o wg0 -j ACCEPT
+    
+    # NAT for client role
+    if [ "$ROLE_CHOICE" = "2" ]; then
+        iptables -t nat -A POSTROUTING -o "$INTERFACE" -j MASQUERADE
+    fi
+    
+    # Save rules
+    if command -v iptables-save >/dev/null 2>&1; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+    fi
+    
+    echo -e "${GREEN}[+] Firewall configured successfully${NC}"
+}
+
+monitor_traffic() {
+    echo -e "${BLUE}[*] Setting up traffic monitoring...${NC}"
+    
+    cat > /usr/local/bin/tunnel_monitor.sh <<'EOF'
+#!/bin/bash
+INTERFACE="wg0"
+LOG_FILE="/var/log/tunnel_monitor.log"
+MAX_LOG_SIZE=1048576 # 1MB
+
+# Rotate log if needed
+if [ -f "$LOG_FILE" ] && [ $(stat -c%s "$LOG_FILE") -gt $MAX_LOG_SIZE ]; then
+    mv "$LOG_FILE" "${LOG_FILE}.1"
+fi
+
+# Get current timestamp
+TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+
+# Get interface stats
+RX_BYTES=$(cat /sys/class/net/$INTERFACE/statistics/rx_bytes)
+TX_BYTES=$(cat /sys/class/net/$INTERFACE/statistics/tx_bytes)
+
+# Calculate human-readable values
+function human_readable {
+    local bytes=$1
+    if [ $bytes -ge 1000000000 ]; then
+        echo "$(echo "scale=2; $bytes/1000000000" | bc) GB"
+    elif [ $bytes -ge 1000000 ]; then
+        echo "$(echo "scale=2; $bytes/1000000" | bc) MB"
+    elif [ $bytes -ge 1000 ]; then
+        echo "$(echo "scale=2; $bytes/1000" | bc) KB"
+    else
+        echo "$bytes bytes"
+    fi
+}
+
+RX_HR=$(human_readable $RX_BYTES)
+TX_HR=$(human_readable $TX_BYTES)
+
+# Log stats
+echo "[$TIMESTAMP] Interface $INTERFACE - RX: $RX_HR | TX: $TX_HR" >> "$LOG_FILE"
+EOF
+    
+    chmod +x /usr/local/bin/tunnel_monitor.sh
+    
+    # Add to crontab to run every 5 minutes
+    (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/tunnel_monitor.sh") | crontab -
+    
+    echo -e "${GREEN}[+] Traffic monitoring configured successfully${NC}"
+}
+
 show_menu() {
     clear
-    IFS=',' read -r ip country isp asn <<< "$(get_server_info)"
-    
-    echo -e "${CYAN}+-------------------------------------------------------------------------+"
-    echo "|   __  __       _        _____           _        _   _             |"
-    echo "|  |  \/  |     | |      |_   _|         | |      | | (_)            |"
-    echo "|  | \  / | __ _| |_ ___   | |  _ __  ___| |_ __ _| |_ _  ___  ___   |"
-    echo "|  | |\/| |/ _  | __/ _ \  | | | '_ \/ __| __/ _  | __| |/ _ \/ __|  |"
-    echo "|  | |  | | (_| | || (_) |_| |_| | | \__ \ || (_| | |_| |  __/\__ \  |"
-    echo "|  |_|  |_|\__,_|\__\___/_____|_| |_|___/\__\__,_|\__|_|\___||___/  |"
-    echo -e "+-------------------------------------------------------------------------+${NC}"    
-    echo -e "| ${YELLOW}Telegram Channel: ${MAGENTA}$AUTHOR${NC}  |  ${YELLOW}Version: ${GREEN}$VERSION${NC}  |"
-    echo -e "${CYAN}+-------------------------------------------------------------------------+${NC}"      
-    echo -e "| ${GREEN}Server IP${NC}         |  $ip"
-    echo -e "| ${GREEN}Server Country${NC}    |  $country"
-    echo -e "| ${GREEN}Server ISP${NC}        |  $isp"
-    echo -e "| ${GREEN}Server ASN${NC}        |  $asn"
-    echo -e "| ${GREEN}Tunnel Status${NC}     |  $(check_vxlan_status)"
-    echo -e "${CYAN}+-------------------------------------------------------------------------+${NC}"
-    echo -e "| ${YELLOW}Please choose an option:${NC}"
-    echo -e "${CYAN}+-------------------------------------------------------------------------+${NC}"
-    echo -e "1. Install new tunnel"
-    echo -e "2. Uninstall tunnel(s)"
-    echo -e "3. Install BBR"
-    echo -e "4. Check tunnel status"
-    echo -e "5. Update script"
-    echo -e "0. Exit"
-    echo -e "${CYAN}+-------------------------------------------------------------------------+${NC}"
-    echo -e "${NC}"
+    echo -e "${BLUE}+-----------------------------------------------------+"
+    echo -e "|               ADVANCED TUNNEL SCRIPT v$VERSION         |"
+    echo -e "+-----------------------------------------------------+${NC}"
+    echo -e "| Server IP: $PUBLIC_IP"
+    echo -e "| Interface: $INTERFACE ($INTERFACE_SPEED $INTERFACE_DUPLEX)"
+    echo -e "| CPU Cores: $CPU_CORES | Memory: ${TOTAL_MEM}MB"
+    echo -e "+-----------------------------------------------------+"
+    echo -e "| ${GREEN}1${NC}. Install Tunnel (WireGuard + Optimizations)"
+    echo -e "| ${GREEN}2${NC}. Uninstall Tunnel"
+    echo -e "| ${GREEN}3${NC}. Show Tunnel Status"
+    echo -e "| ${GREEN}4${NC}. Optimize Network Settings"
+    echo -e "| ${GREEN}5${NC}. Configure QoS"
+    echo -e "| ${GREEN}6${NC}. Monitor Traffic"
+    echo -e "| ${GREEN}0${NC}. Exit"
+    echo -e "+-----------------------------------------------------+${NC}"
 }
 
-# Function to validate IP address
-validate_ip() {
-    local ip=$1
-    local stat=1
+show_status() {
+    echo -e "${BLUE}[*] Current tunnel status:${NC}"
     
-    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        IFS='.' read -r -a octets <<< "$ip"
-        [[ ${octets[0]} -le 255 && ${octets[1]} -le 255 && \
-           ${octets[2]} -le 255 && ${octets[3]} -le 255 ]]
-        stat=$?
-    fi
-    
-    return $stat
-}
-
-# Function to validate port
-validate_port() {
-    local port=$1
-    [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
-}
-
-# Function to uninstall all VXLAN tunnels
-uninstall_vxlan() {
-    info_msg "Removing all VXLAN tunnels..."
-    
-    # Remove VXLAN interfaces
-    for iface in $(ip -d link show | grep -o 'vxlan[0-9]\+'); do
-        info_msg "Removing interface $iface..."
-        ip link del $iface 2>/dev/null || \
-            error_msg "Failed to remove interface $iface"
-    done
-    
-    # Remove scripts and services
-    rm -f /usr/local/bin/vxlan_bridge.sh /etc/ping_vxlan.sh
-    
-    # Disable and remove service
-    if systemctl is-active --quiet vxlan-tunnel.service; then
-        info_msg "Stopping vxlan-tunnel service..."
-        systemctl stop vxlan-tunnel.service || \
-            error_msg "Failed to stop vxlan-tunnel service"
-    fi
-    
-    if systemctl is-enabled --quiet vxlan-tunnel.service; then
-        info_msg "Disabling vxlan-tunnel service..."
-        systemctl disable vxlan-tunnel.service || \
-            error_msg "Failed to disable vxlan-tunnel service"
-    fi
-    
-    rm -f /etc/systemd/system/vxlan-tunnel.service
-    systemctl daemon-reload
-    
-    # Clean up HAProxy
-    if systemctl is-active --quiet haproxy; then
-        info_msg "Stopping HAProxy service..."
-        systemctl stop haproxy || \
-            error_msg "Failed to stop HAProxy service"
-    fi
-    
-    if systemctl is-enabled --quiet haproxy; then
-        info_msg "Disabling HAProxy service..."
-        systemctl disable haproxy || \
-            error_msg "Failed to disable HAProxy service"
-    fi
-    
-    # Remove HAProxy config
-    rm -f /etc/haproxy/haproxy.cfg
-    
-    success_msg "VXLAN tunnels and related services have been removed"
-}
-
-# Function to install BBR
-install_bbr() {
-    info_msg "Installing BBR..."
-    
-    if ! curl -fsSL "${GITHUB_REPO}/raw/main/scripts/bbr.sh" -o /tmp/bbr.sh; then
-        error_msg "Failed to download BBR script"
-        return 1
-    fi
-    
-    if ! bash /tmp/bbr.sh; then
-        error_msg "BBR installation failed"
-        return 1
-    fi
-    
-    rm -f /tmp/bbr.sh
-    success_msg "BBR installed successfully"
-    return 0
-}
-
-# Function to configure HAProxy
-configure_haproxy() {
-    local config_file="/etc/haproxy/haproxy.cfg"
-    local backup_file="/etc/haproxy/haproxy.cfg.bak"
-    
-    info_msg "Configuring HAProxy..."
-    
-    # Backup existing config
-    if [[ -f $config_file ]]; then
-        info_msg "Backing up existing HAProxy config..."
-        cp "$config_file" "$backup_file" || {
-            error_msg "Failed to backup HAProxy config"
-            return 1
-        }
-    fi
-    
-    # Get ports from user
-    while true; do
-        read -p "Enter ports to forward (comma-separated, e.g., 80,443): " ports_input
-        if [[ -z $ports_input ]]; then
-            error_msg "Ports cannot be empty"
-            continue
-        fi
-        
-        # Validate ports
-        local valid=true
-        IFS=',' read -ra ports <<< "$ports_input"
-        for port in "${ports[@]}"; do
-            if ! validate_port "$port"; then
-                error_msg "Invalid port: $port"
-                valid=false
-                break
-            fi
-        done
-        
-        $valid && break
-    done
-    
-    local local_ip=$(hostname -I | awk '{print $1}')
-    
-    # Generate new config
-    cat <<EOF > "$config_file"
-global
-    log /dev/log local0
-    log /dev/log local1 notice
-    chroot /var/lib/haproxy
-    stats socket /run/haproxy/admin.sock mode 660 level admin
-    stats timeout 30s
-    user haproxy
-    group haproxy
-    daemon
-    maxconn 20000
-    tune.ssl.default-dh-param 2048
-
-defaults
-    log global
-    mode tcp
-    option dontlognull
-    option redispatch
-    retries 3
-    timeout connect 5000
-    timeout client 50000
-    timeout server 50000
-    maxconn 10000
-EOF
-
-    # Add frontend and backend for each port
-    for port in "${ports[@]}"; do
-        cat <<EOF >> "$config_file"
-
-frontend fr_$port
-    bind *:$port
-    default_backend bk_$port
-
-backend bk_$port
-    server server1 $local_ip:$port check
-EOF
-    done
-    
-    # Add stats endpoint
-    cat <<EOF >> "$config_file"
-
-listen stats
-    bind *:1936
-    stats enable
-    stats uri /
-    stats hide-version
-    stats auth admin:${RANDOM_PASSWORD:-$(openssl rand -hex 8)}
-EOF
-    
-    # Validate config
-    if ! haproxy -c -f "$config_file"; then
-        error_msg "HAProxy configuration is invalid"
-        if [[ -f $backup_file ]]; then
-            warning_msg "Restoring previous HAProxy config..."
-            mv "$backup_file" "$config_file"
-        fi
-        return 1
-    fi
-    
-    # Restart HAProxy
-    info_msg "Restarting HAProxy..."
-    systemctl restart haproxy || {
-        error_msg "Failed to restart HAProxy"
-        return 1
-    }
-    
-    success_msg "HAProxy configured successfully"
-    info_msg "Stats page available at: http://${local_ip}:1936/"
-    return 0
-}
-
-# Function to setup VXLAN tunnel
-setup_vxlan() {
-    local role=$1
-    local iran_ip=$2
-    local kharej_ip=$3
-    local port=$4
-    
-    local vni=88
-    local vxlan_if="vxlan${vni}"
-    local local_ip=$(hostname -I | awk '{print $1}')
-    
-    # Determine VXLAN parameters based on role
-    if [[ $role == "iran" ]]; then
-        local vxlan_ip="30.0.0.1/24"
-        local remote_ip=$kharej_ip
+    # WireGuard status
+    if systemctl is-active --quiet wg-quick@wg0; then
+        echo -e "${GREEN}[+] WireGuard is running${NC}"
+        wg show
     else
-        local vxlan_ip="30.0.0.2/24"
-        local remote_ip=$iran_ip
+        echo -e "${RED}[-] WireGuard is not running${NC}"
     fi
     
-    # Detect main interface
-    local interface=$(ip route get 1.1.1.1 | awk '{print $5}' | head -n1)
-    if [[ -z $interface ]]; then
-        error_msg "Could not detect main network interface"
-        return 1
-    fi
+    # Interface statistics
+    echo -e "\n${BLUE}Interface statistics:${NC}"
+    ip -s link show wg0 2>/dev/null || echo -e "${RED}WireGuard interface not found${NC}"
     
-    info_msg "Setting up VXLAN tunnel..."
-    info_msg "Role: $role"
-    info_msg "Local IP: $local_ip"
-    info_msg "Remote IP: $remote_ip"
-    info_msg "VXLAN Interface: $vxlan_if"
-    info_msg "VXLAN IP: $vxlan_ip"
-    info_msg "Port: $port"
-    info_msg "Network Interface: $interface"
+    # Connection quality
+    echo -e "\n${BLUE}Connection quality:${NC}"
+    ping -c 4 1.1.1.1 | tail -n 2
     
-    # Create VXLAN interface
-    if ! ip link add $vxlan_if type vxlan id $vni local $local_ip remote $remote_ip dev $interface dstport $port nolearning; then
-        error_msg "Failed to create VXLAN interface"
-        return 1
-    fi
-    
-    # Assign IP address
-    if ! ip addr add $vxlan_ip dev $vxlan_if; then
-        error_msg "Failed to assign IP to VXLAN interface"
-        ip link del $vxlan_if 2>/dev/null
-        return 1
-    fi
-    
-    # Bring interface up
-    if ! ip link set $vxlan_if up; then
-        error_msg "Failed to bring up VXLAN interface"
-        ip link del $vxlan_if 2>/dev/null
-        return 1
-    fi
-    
-    # Add iptables rules
-    info_msg "Configuring iptables rules..."
-    iptables -I INPUT -p udp --dport $port -j ACCEPT || \
-        warning_msg "Failed to add UDP port rule to iptables"
-    iptables -I INPUT -s $remote_ip -j ACCEPT || \
-        warning_msg "Failed to add remote IP rule to iptables"
-    iptables -I INPUT -s ${vxlan_ip%/*} -j ACCEPT || \
-        warning_msg "Failed to add VXLAN IP rule to iptables"
-    
-    # Create persistent service
-    create_vxlan_service $vxlan_if $vni $local_ip $remote_ip $interface $port $vxlan_ip
-    
-    success_msg "VXLAN tunnel setup completed successfully"
-    
-    if [[ $role == "iran" ]]; then
-        echo -e "${CYAN}+-----------------------------------------------+"
-        echo -e "| ${YELLOW}Iran Server Configuration${NC}              |"
-        echo -e "${CYAN}+-----------------------------------------------+"
-        echo -e "| ${GREEN}VXLAN IP${NC}         | 30.0.0.1             |"
-        echo -e "| ${GREEN}Tunnel Port${NC}      | $port                |"
-        echo -e "${CYAN}+-----------------------------------------------+${NC}"
-    else
-        echo -e "${CYAN}+-----------------------------------------------+"
-        echo -e "| ${YELLOW}Kharej Server Configuration${NC}            |"
-        echo -e "${CYAN}+-----------------------------------------------+"
-        echo -e "| ${GREEN}VXLAN IP${NC}         | 30.0.0.2             |"
-        echo -e "| ${GREEN}Tunnel Port${NC}      | $port                |"
-        echo -e "${CYAN}+-----------------------------------------------+${NC}"
-    fi
-    
-    return 0
+    # Traffic statistics
+    echo -e "\n${BLUE}Traffic statistics:${NC}"
+    ifstat -i wg0,"$INTERFACE" -n -q 1 1
 }
 
-# Function to create systemd service for VXLAN
-create_vxlan_service() {
-    local vxlan_if=$1
-    local vni=$2
-    local local_ip=$3
-    local remote_ip=$4
-    local interface=$5
-    local port=$6
-    local vxlan_ip=$7
+uninstall_tunnel() {
+    echo -e "${BLUE}[*] Uninstalling tunnel...${NC}"
     
-    info_msg "Creating persistent VXLAN service..."
+    # Stop and disable WireGuard
+    systemctl stop wg-quick@wg0 2>/dev/null
+    systemctl disable wg-quick@wg0 2>/dev/null
     
-    # Create bridge script
-    cat <<EOF > /usr/local/bin/vxlan_bridge.sh
-#!/bin/bash
-
-# Wait for network to be ready
-while ! ping -c 1 -W 1 $remote_ip &> /dev/null; do
-    sleep 1
-done
-
-# Create VXLAN interface
-ip link add $vxlan_if type vxlan id $vni local $local_ip remote $remote_ip dev $interface dstport $port nolearning
-ip addr add $vxlan_ip dev $vxlan_if
-ip link set $vxlan_if up
-
-# Add iptables rules
-iptables -I INPUT -p udp --dport $port -j ACCEPT
-iptables -I INPUT -s $remote_ip -j ACCEPT
-iptables -I INPUT -s ${vxlan_ip%/*} -j ACCEPT
-EOF
+    # Remove configuration
+    rm -f /etc/wireguard/wg0.conf
+    rm -rf "$CONFIG_DIR"
     
-    chmod +x /usr/local/bin/vxlan_bridge.sh
+    # Remove monitoring
+    rm -f /usr/local/bin/tunnel_monitor.sh
+    crontab -l | grep -v tunnel_monitor.sh | crontab -
     
-    # Create systemd service
-    cat <<EOF > /etc/systemd/system/vxlan-tunnel.service
-[Unit]
-Description=VXLAN Tunnel Interface
-After=network.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/vxlan_bridge.sh
-TimeoutStartSec=300
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    # Reset firewall
+    iptables -F
+    iptables -X
+    iptables -t nat -F
+    iptables -t nat -X
+    iptables -t mangle -F
+    iptables -t mangle -X
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
     
-    systemctl daemon-reload
-    systemctl enable vxlan-tunnel.service
-    systemctl start vxlan-tunnel.service
-    
-    # Verify service is running
-    if ! systemctl is-active --quiet vxlan-tunnel.service; then
-        error_msg "Failed to start vxlan-tunnel service"
-        return 1
-    fi
-    
-    success_msg "VXLAN service created and started successfully"
-    return 0
+    echo -e "${GREEN}[+] Tunnel uninstalled successfully${NC}"
 }
 
-# Function to check tunnel status
-check_tunnel_status() {
-    local vxlan_count=$(ip -d link show | grep -c 'vxlan[0-9]\+')
-    
-    if [[ $vxlan_count -eq 0 ]]; then
-        info_msg "No active VXLAN tunnels found"
-        return 0
-    fi
-    
-    echo -e "${CYAN}+-----------------------------------------------+"
-    echo -e "| ${YELLOW}Active VXLAN Tunnels ($vxlan_count)${NC}               |"
-    echo -e "${CYAN}+-----------------------------------------------+"
-    
-    ip -d link show | grep 'vxlan[0-9]\+' | while read -r line; do
-        local iface=$(echo "$line" | awk -F: '{print $2}' | xargs)
-        local vni=$(echo "$line" | grep -o 'vni [0-9]\+' | awk '{print $2}')
-        local local_ip=$(ip -d link show "$iface" | grep -o 'local [0-9.]\+' | awk '{print $2}')
-        local remote_ip=$(ip -d link show "$iface" | grep -o 'remote [0-9.]\+' | awk '{print $2}')
-        local port=$(ip -d link show "$iface" | grep -o 'dstport [0-9]\+' | awk '{print $2}')
-        
-        echo -e "| ${GREEN}Interface${NC}  | $iface"
-        echo -e "| ${GREEN}VNI${NC}        | $vni"
-        echo -e "| ${GREEN}Local IP${NC}   | $local_ip"
-        echo -e "| ${GREEN}Remote IP${NC}  | $remote_ip"
-        echo -e "| ${GREEN}Port${NC}       | $port"
-        echo -e "${CYAN}+-----------------------------------------------+${NC}"
-    done
-    
-    return 0
-}
-
-# Function to update script
-update_script() {
-    info_msg "Checking for updates..."
-    
-    local temp_file="/tmp/vxlan_tunnel_updater.sh"
-    
-    if ! curl -fsSL "${GITHUB_REPO}/raw/main/scripts/vxlan_tunnel.sh" -o "$temp_file"; then
-        error_msg "Failed to download updated script"
-        return 1
-    fi
-    
-    # Verify the downloaded script
-    if ! grep -q "VXLAN Tunnel Script" "$temp_file"; then
-        error_msg "Downloaded file doesn't appear to be a valid script"
-        rm -f "$temp_file"
-        return 1
-    fi
-    
-    # Compare versions
-    local current_version=$VERSION
-    local new_version=$(grep -m1 "VERSION=" "$temp_file" | cut -d'"' -f2)
-    
-    if [[ "$current_version" == "$new_version" ]]; then
-        info_msg "You already have the latest version ($VERSION)"
-        rm -f "$temp_file"
-        return 0
-    fi
-    
-    info_msg "Updating from version $current_version to $new_version"
-    
-    # Backup current script
-    local backup_file="${0}.bak"
-    cp "$0" "$backup_file" || {
-        error_msg "Failed to backup current script"
-        rm -f "$temp_file"
-        return 1
-    }
-    
-    # Replace script
-    if ! mv "$temp_file" "$0"; then
-        error_msg "Failed to replace script"
-        rm -f "$temp_file"
-        return 1
-    fi
-    
-    chmod +x "$0"
-    
-    success_msg "Script updated successfully to version $new_version"
-    info_msg "Please run the script again to use the new version"
-    
-    exit 0
-}
-
-# ---------------- MAIN PROGRAM ----------------
+# ---------------- MAIN EXECUTION ----------------
 check_root
-install_dependencies || {
-    error_msg "Failed to install required dependencies"
-    exit 1
-}
+install_dependencies
+get_server_info
 
 while true; do
     show_menu
-    read -p "Enter your choice [0-5]: " choice
+    read -rp "Enter your choice [0-6]: " choice
     
     case $choice in
         1)
-            # Install new tunnel
-            echo "Choose server role:"
-            echo "1. Iran"
-            echo "2. Kharej"
-            read -p "Enter choice (1/2): " role_choice
-            
-            if [[ "$role_choice" != "1" && "$role_choice" != "2" ]]; then
-                error_msg "Invalid choice"
-                sleep 2
-                continue
-            fi
-            
-            # Get IP addresses
-            while true; do
-                read -p "Enter IRAN IP: " iran_ip
-                if validate_ip "$iran_ip"; then
-                    break
-                else
-                    error_msg "Invalid IP address"
-                fi
-            done
-            
-            while true; do
-                read -p "Enter Kharej IP: " kharej_ip
-                if validate_ip "$kharej_ip"; then
-                    break
-                else
-                    error_msg "Invalid IP address"
-                fi
-            done
-            
-            # Get port
-            while true; do
-                read -p "Enter tunnel port (1-65535): " port
-                if validate_port "$port"; then
-                    break
-                else
-                    error_msg "Invalid port number"
-                fi
-            done
-            
-            # Configure HAProxy for Iran server
-            if [[ "$role_choice" == "1" ]]; then
-                read -p "Configure HAProxy for port forwarding? [y/N]: " haproxy_choice
-                if [[ "$haproxy_choice" =~ ^[Yy]$ ]]; then
-                    configure_haproxy || {
-                        error_msg "HAProxy configuration failed"
-                        sleep 3
-                        continue
-                    }
-                fi
-            fi
-            
-            # Setup VXLAN
-            if [[ "$role_choice" == "1" ]]; then
-                role="iran"
-            else
-                role="kharej"
-            fi
-            
-            setup_vxlan "$role" "$iran_ip" "$kharej_ip" "$port" || {
-                error_msg "VXLAN setup failed"
-            }
-            
-            read -p "Press Enter to continue..."
+            optimize_kernel
+            generate_wireguard_keys
+            setup_wireguard
+            configure_qos
+            configure_firewall
+            monitor_traffic
+            echo -e "${GREEN}[+] Tunnel installation complete!${NC}"
+            read -rp "Press Enter to continue..."
             ;;
         2)
-            # Uninstall tunnel(s)
-            read -p "Are you sure you want to uninstall all tunnels? [y/N]: " confirm
-            if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                uninstall_vxlan
-            fi
-            read -p "Press Enter to continue..."
+            uninstall_tunnel
+            read -rp "Press Enter to continue..."
             ;;
         3)
-            # Install BBR
-            install_bbr
-            read -p "Press Enter to continue..."
+            show_status
+            read -rp "Press Enter to continue..."
             ;;
         4)
-            # Check tunnel status
-            check_tunnel_status
-            read -p "Press Enter to continue..."
+            optimize_kernel
+            echo -e "${GREEN}[+] Network optimizations applied${NC}"
+            read -rp "Press Enter to continue..."
             ;;
         5)
-            # Update script
-            update_script
-            read -p "Press Enter to continue..."
+            configure_qos
+            read -rp "Press Enter to continue..."
+            ;;
+        6)
+            monitor_traffic
+            read -rp "Press Enter to continue..."
             ;;
         0)
-            # Exit
-            info_msg "Goodbye!"
+            echo -e "${BLUE}[*] Exiting...${NC}"
             exit 0
             ;;
         *)
-            error_msg "Invalid option"
+            echo -e "${RED}[ERROR] Invalid option${NC}"
             sleep 1
             ;;
     esac
